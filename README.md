@@ -36,8 +36,6 @@ This paper studies Unsupervised Domain Adaptation (UDA), where a model is traine
 
 ## Getting Started
 
-> Note: The supplied paper material does not include an official code repository. The command below is a placeholder template only.
-
 ```bash
 python main.py \
   --gpu 0 \

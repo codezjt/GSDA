@@ -1,0 +1,215 @@
+# coding=utf-8
+import torch
+import torch.nn as nn
+import torch.utils.model_zoo as model_zoo
+import math
+from utils.permutedAdaIN import PermuteAdaptiveInstanceNorm2d
+
+__all__ = ['ResNet', 'resnet18']
+
+model_urls = {
+    'resnet18': 'https://download.pytorch.org/models/resnet18-5c106cde.pth'
+}
+
+
+def conv3x3(in_planes, out_planes, stride=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
+                     padding=1, bias=False)
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(BasicBlock, self).__init__()
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.downsample = downsample
+        self.stride = stride
+        self.permute_adain = PermuteAdaptiveInstanceNorm2d(p=0.01)
+
+        # if with_permute_adain:
+        #     self.permute_adain=PermuteAdaptiveInstanceNorm2d(p=p_adain)
+        # self.with_permute_adain=with_permute_adain
+
+    def forward(self, x_padain):
+        x, p_adain = x_padain
+        residual = x
+
+        out = self.conv1(x)
+        if p_adain:
+            # print("BasicBlock卷积置换")
+            out = self.permute_adain(out)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        if p_adain:
+            out = self.permute_adain(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out, p_adain
+
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(Bottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride,
+                               padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes, planes * 4, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes * 4)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+        self.permute_adain = PermuteAdaptiveInstanceNorm2d(p=0.01)
+
+    def forward(self, x_padain):
+        x, p_adain = x_padain
+        residual = x
+
+        out = self.conv1(x)
+        if p_adain:
+            # print("Bottleneck卷积置换----------------------")
+            out = self.permute_adain(out)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        if p_adain:
+            out = self.permute_adain(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        if p_adain:
+            out = self.permute_adain(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            residual = self.downsample(x)
+
+        out += residual
+        out = self.relu(out)
+
+        return out, p_adain
+
+
+class ResNet(nn.Module):
+
+    def __init__(self, block, layers, num_classes=1000):
+        self.inplanes = 64
+        super(ResNet, self).__init__()
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
+                               bias=False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(block, 128, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, 256, layers[2], stride=2)
+        self.layer4 = self._make_layer(block, 512, layers[3], stride=2)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+        self.fc.weight.data.normal_(0, 0.01)
+        self.fc.bias.data.fill_(0.0)
+
+        self.permute_adain = PermuteAdaptiveInstanceNorm2d(p=0.01)
+
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+                m.weight.data.normal_(0, math.sqrt(2. / n))
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+    def _make_layer(self, block, planes, blocks, stride=1):
+        downsample = None
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.inplanes, planes * block.expansion,
+                          kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(block(self.inplanes, planes, stride, downsample))
+        self.inplanes = planes * block.expansion
+        for i in range(1, blocks):
+            layers.append(block(self.inplanes, planes))
+
+        return nn.Sequential(*layers)
+
+    def forward(self, x_padain):
+        x, p_adain = x_padain
+        x = self.conv1(x)
+        if p_adain:
+            # print("第一个卷积置换")
+            x = self.permute_adain(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x, _ = self.layer1((x, p_adain))
+        x, _ = self.layer2((x, p_adain))
+        x, _ = self.layer3((x, False))
+        x, _ = self.layer4((x, False))
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+
+        return x
+
+    def output_num(self):
+        return resnet18(True).fc.in_features
+
+
+class ResNet18(nn.Module):
+
+
+    def __init__(self):
+        super(ResNet18, self).__init__()
+        self.encoder = resnet18(False)
+        self.encoder.load_state_dict(torch.load('/media/ubuntu/7d17c4ae-0255-4946-a82e-1ebcb5295708/zjt/resnet18-5c106cde.pth'))
+
+    def forward(self, x, p_adain=0):
+        x = self.encoder(x, p_adain)
+        return x
+
+
+class Head(nn.Module):
+    def __init__(self):
+        super(Head, self).__init__()
+        self.head = nn.Sequential(
+            # nn.Linear(2048, 256),  # Resnet-50输出维度
+            # nn.BatchNorm1d(256),
+            nn.Linear(512, 256),  # Resnet-18输出维度
+            nn.BatchNorm1d(256),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        x = self.head(x)
+        return x
+
+
+def resnet18(pretrained=False, **kwargs):
+    model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
+    if pretrained:
+        model.load_state_dict(model_zoo.load_url(model_urls['resnet18']))
+    return model
